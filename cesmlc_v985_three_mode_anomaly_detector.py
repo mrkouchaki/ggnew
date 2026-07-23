@@ -1,3 +1,7 @@
+
+python -c "import pandas as pd; p=r'C:\Temp\v985_compare_outputs_v2\cesmlc_v98_candidate_decision_audit.csv'; d=pd.read_csv(p); g=d.groupby('ECGI')['MODEL_NORMAL_PERCENTILE'].max(); print('>=99.5:',(g>=99.5).sum()); print('>=99.95:',(g>=99.95).sum()); print('>=99.998:',(g>=99.998).sum()); print('=100:',(g>=100).sum())"
+
+
 #!/usr/bin/env python
 """
 CESMLC V9.8.5 three-mode, window-mismatch, memory-efficient detector.
