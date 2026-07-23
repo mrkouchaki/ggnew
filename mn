@@ -1,0 +1,3 @@
+
+
+python -c "import pandas as pd; p=r'C:\Temp\cesmlc_v985_window_gate_cache\v98_change_events.pkl'; d=pd.read_pickle(p); x=d[d['FEATURE'].isin(['ANTENNAORIENTATION','ANTENNAOPENING'])]; print(x.groupby(['POPULATION','FEATURE','LOAD_DATE']).agg(EVENTS=('ECGI','size'),ECGIS=('ECGI','nunique')).sort_values('EVENTS',ascending=False).head(30).to_string())"
