@@ -1,44 +1,3 @@
-tyt
-
-
-
-python "C:\Temp\cesmlc_v985_three_mode_anomaly_detector.py" `
-  --input "C:\Temp\enmt_cesmlc_lte_audit_p_akr3aesme01_31d_withDB_v3.csv" `
-  --cell-viewer-data "C:\Temp\cell_viewer_data.csv" `
-  --strict-site-type-context `
-  --candidate-gate window_any_mismatch `
-  --candidate-gate-days 30 `
-  --candidate-mismatch-min-days 1 `
-  --out-dir "C:\Temp\v985_mode3_outputs" `
-  --days 30 `
-  --stable-days 10 `
-  --history-anchor-days 7 `
-  --latlon-decimals 5 `
-  --high-frequency-min-change-days 2 `
-  --multi-feature-min-features 2 `
-  --multi-feature-min-dates 2 `
-  --multi-max-dominant-date-share 0.67 `
-  --detection-mode 3 `
-  --if-dominant-percentile 98 `
-  --kmeans-clusters 4 `
-  --kmeans-rule-compatibility `
-  --tune-isolation-forest `
-  --isolation-seeds "17,42,73" `
-  --isolation-n-estimators 400 `
-  --isolation-max-samples 2048 `
-  --isolation-max-features 0.80 `
-  --normal-baseline-max-ecgis 50000 `
-  --isolation-fit-sample 50000 `
-  --memory-limit 10GB `
-  --threads 4 `
-  --feature-batch-size 1 `
-  --reuse-history-cache `
-  --history-cache-dir "C:\Temp\cesmlc_v984_window_gate_cache" `
-  --cache-match-mode compatible `
-  --cache-input-identity basename
-
-
-
 #!/usr/bin/env python
 """
 CESMLC V9.8.5 three-mode, window-mismatch, memory-efficient detector.
@@ -52,7 +11,9 @@ Modes
   deterministic IF evidence plus the existing signature decision tree.
 * ``if_dominant`` admits an ECGI when a changed/model-scored feature reaches
   ``--if-dominant-percentile``. KMeans then describes admitted ECGIs, while
-  the full-history signature mapper alone assigns one of the same four labels.
+  the full-history signature mapper assigns one of the same four labels.
+  Ordinary one-time RARE fallbacks are rejected unless the existing held-out
+  same-age one-change conformal model confirms an independent extreme.
 * ``compare`` runs both projections, produces a one-row-per-ECGI union with
   detector and cluster agreement, and writes two optional pie charts.
 
@@ -83,8 +44,10 @@ Detection contract
 8. Defaults, fallback values, location-shift magnitude, invalid-range rules,
    persistence aliases, and peer-rollout suppressors do not create or suppress
    an incident.
-9. Scores rank already-qualified incidents.  There is no second score gate that
-   can delete a rule-qualified result.
+9. In Mode 1, scores only rank rule-qualified incidents. Mode 2 uses
+   ``--if-dominant-percentile`` for raw model admission, then rejects only an
+   ordinary one-time RARE fallback that lacks independently calibrated
+   one-change evidence. Recurrent, BF, HF, and multi-feature paths remain.
 10. Each feature Isolation Forest is a deterministic multi-seed ensemble with
     seed-specific held-out-normal calibration. Optional fine-tuning happens
     strictly inside the fit pool; candidates and the outer calibration holdout
@@ -2921,6 +2884,7 @@ def _copy_mode1_decisions(data: pd.DataFrame) -> pd.DataFrame:
 
 def _ecgi_if_admission(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     """Admit an ECGI when at least one genuinely scored feature crosses the Mode-2 tail."""
+    header("PHASE 5A - MODE-2 ISOLATION-FOREST ADMISSION")
     result = data.copy()
     if result.empty:
         return result
@@ -2945,20 +2909,89 @@ def _ecgi_if_admission(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataF
         result["IF_DOMINANT_FEATURE_DETECTED_FLAG"]
         .groupby(result["ECGI"]).transform("sum").fillna(0).astype(int)
     )
+    scored = (
+        result["POPULATION"].eq("CANDIDATE")
+        & col_num(result, "MODEL_AVAILABLE_FLAG", 0).eq(1)
+        & col_num(result, "SOURCE_CHANGE_EVENTS", 0).gt(0)
+    )
+    passed = result["IF_DOMINANT_FEATURE_DETECTED_FLAG"].eq(1)
+    admitted = result["IF_DOMINANT_ECGI_DETECTED_FLAG"].eq(1)
+    scored_ecgi_max = (
+        col_num(result, "MODEL_NORMAL_PERCENTILE", 0)
+        .where(scored)
+        .groupby(result["ECGI"]).max().dropna()
+    )
+    exact_100_ecgis = int(scored_ecgi_max.ge(100.0 - 1e-12).sum())
+    log(
+        f"IF threshold={threshold:.4f}; scored changed feature rows="
+        f"{int(scored.sum()):,}; feature rows passing threshold="
+        f"{int(passed.sum()):,}; ECGIs admitted={int(result.loc[admitted, 'ECGI'].nunique()):,}; "
+        f"scored ECGIs with max percentile=100: {exact_100_ecgis:,}.",
+        1,
+    )
     return result
 
 
-def _structural_mode2_cluster(data: pd.DataFrame) -> pd.Series:
-    """Map IF-admitted ECGIs with full-history signatures; KMeans is not consulted."""
-    admitted = data.loc[
-        col_num(data, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0).eq(1)
-    ].copy()
-    if admitted.empty:
-        return pd.Series(dtype=object, name="MODE2_MAPPED_CLUSTER")
-    flags = admitted.groupby("ECGI", as_index=True).agg(
-        HAS_BACK_FORTH=("RAW_REAL_BACK_AND_FORTH_FLAG", "max"),
-        HAS_HIGH_FREQUENCY=("RAW_HIGH_FREQUENCY_CHANGES_FLAG", "max"),
-        HAS_MULTI_FEATURE=("MULTI_FEATURE_CHANGES_FLAG", "max"),
+def _inspect_mode2_signatures(
+    data: pd.DataFrame,
+    events: Optional[pd.DataFrame],
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    """Inspect source history only after IF admission and map business signatures.
+
+    This is intentionally independent of ``assign_feature_clusters`` and every
+    Mode-1/RAW decision flag.  Mode 2 starts from model scores, clusters the
+    admitted anomalies, and only then explains those anomalies from their
+    already-engineered temporal metrics and admitted change events.
+    """
+    result = data.copy()
+    admitted = col_num(result, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0).eq(1)
+    recurrent = (
+        col_num(result, "SOURCE_CHANGE_DAYS", 0).ge(2)
+        & col_num(result, "SOURCE_CHANGE_EVENTS", 0).ge(2)
+    )
+    reversals = (
+        col_num(result, "A_B_A_REVERT_COUNT", 0)
+        + col_num(result, "REVERSE_TRANSITION_COUNT", 0)
+    )
+    result["MODE2_SIGNATURE_BACK_FORTH_FLAG"] = (
+        admitted & recurrent & reversals.gt(0)
+    ).astype(int)
+    result["MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG"] = (
+        admitted
+        & col_num(result, "SOURCE_CHANGE_DAYS", 0).ge(
+            int(args.high_frequency_min_change_days)
+        )
+    ).astype(int)
+
+    admitted_ecgis = set(
+        result.loc[admitted, "ECGI"].dropna().astype(str)
+    )
+    if events is None or events.empty or not admitted_ecgis:
+        admitted_events = pd.DataFrame()
+    else:
+        admitted_events = events.loc[
+            events["POPULATION"].astype(str).eq("CANDIDATE")
+            & events["ECGI"].astype(str).isin(admitted_ecgis)
+        ].copy()
+    # Rebuild topology from admitted histories only. This function consumes
+    # source change events, not any Mode-1 decision.
+    result = build_multi_feature_topology(result, admitted_events, args)
+    # The topology merge may replace a non-consecutive source index with a new
+    # RangeIndex. Rebuild the mask from the returned frame so boolean alignment
+    # is correct for production data as well as compact unit fixtures.
+    admitted = col_num(
+        result, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0
+    ).eq(1)
+    result["MODE2_SIGNATURE_MULTI_FEATURE_FLAG"] = (
+        admitted
+        & col_num(result, "MULTI_FEATURE_CHANGES_FLAG", 0).eq(1)
+    ).astype(int)
+
+    flags = result.loc[admitted].groupby("ECGI", as_index=True).agg(
+        HAS_BACK_FORTH=("MODE2_SIGNATURE_BACK_FORTH_FLAG", "max"),
+        HAS_HIGH_FREQUENCY=("MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG", "max"),
+        HAS_MULTI_FEATURE=("MODE2_SIGNATURE_MULTI_FEATURE_FLAG", "max"),
     )
     mapped = np.select(
         [
@@ -2973,7 +3006,51 @@ def _structural_mode2_cluster(data: pd.DataFrame) -> pd.Series:
         ],
         default="RARE_CHANGES",
     )
-    return pd.Series(mapped, index=flags.index, name="MODE2_MAPPED_CLUSTER")
+    mapping = pd.Series(mapped, index=flags.index)
+    result["MODE2_MAPPED_CLUSTER"] = result["ECGI"].map(mapping).fillna("")
+
+    # Compatibility aliases are regenerated from Mode-2 inspection so existing
+    # audits remain readable; they are not inputs to this path.
+    result["RAW_REAL_BACK_AND_FORTH_FLAG"] = result[
+        "MODE2_SIGNATURE_BACK_FORTH_FLAG"
+    ]
+    result["RAW_HIGH_FREQUENCY_CHANGES_FLAG"] = result[
+        "MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG"
+    ]
+    result["RAW_BACKFORTH_AND_HIGH_FREQUENCY_OVERLAP_FLAG"] = (
+        result["MODE2_SIGNATURE_BACK_FORTH_FLAG"].eq(1)
+        & result["MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG"].eq(1)
+    ).astype(int)
+    rare_mapped = (
+        admitted
+        & result["MODE2_MAPPED_CLUSTER"].eq("RARE_CHANGES")
+        & col_num(result, "IF_DOMINANT_FEATURE_DETECTED_FLAG", 0).eq(1)
+    )
+    result["RAW_RARE_RECURRENT_MODEL_FLAG"] = (
+        rare_mapped
+        & col_num(result, "SOURCE_CHANGE_DAYS", 0).ge(2)
+        & col_num(result, "SOURCE_CHANGE_EVENTS", 0).ge(2)
+    ).astype(int)
+    # Mode 2 intentionally uses its configured general IF percentile rather
+    # than Mode 1's one-change conditional-conformal decision branch.
+    result["RAW_RARE_ONE_CHANGE_CONDITIONAL_MODEL_FLAG"] = 0
+    result["RAW_RARE_CONFLICT_FLAG"] = (
+        admitted
+        & (
+            col_num(result, "CURRENT_DAY_SAME_DAY_CONFLICT_FLAG", 0).eq(1)
+            | col_num(result, "RECURRENT_SAME_DAY_CONFLICT_FLAG", 0).eq(1)
+        )
+    ).astype(int)
+    result["RAW_MULTI_FEATURE_TOPOLOGY_FLAG"] = col_num(
+        result, "RAW_MULTI_FEATURE_TOPOLOGY_FLAG", 0
+    ).astype(int)
+    result["RAW_QUALIFIED_FEATURE_FLAG"] = (
+        result["MODE2_SIGNATURE_BACK_FORTH_FLAG"].eq(1)
+        | result["MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG"].eq(1)
+        | result["MODE2_SIGNATURE_MULTI_FEATURE_FLAG"].eq(1)
+        | col_num(result, "IF_DOMINANT_FEATURE_DETECTED_FLAG", 0).eq(1)
+    ).astype(int)
+    return result
 
 
 def _mode2_ecgi_vectors(data: pd.DataFrame) -> pd.DataFrame:
@@ -3042,7 +3119,7 @@ def _add_kmeans_diagnostics(
     data: pd.DataFrame,
     args: argparse.Namespace,
 ) -> pd.DataFrame:
-    """Cluster admitted ECGIs for diagnostics only; never alter admission or mapping."""
+    """Cluster IF-admitted ECGIs before rule explanation."""
     result = data.copy()
     result["KMEANS_CLUSTER"] = pd.Series(pd.NA, index=result.index, dtype="Int64")
     result["KMEANS_DISTANCE_TO_CENTROID"] = np.nan
@@ -3084,11 +3161,22 @@ def _add_kmeans_diagnostics(
     result.loc[ecgi.isin(cluster_map), "KMEANS_SELECTED_K"] = int(k)
     result.loc[ecgi.isin(cluster_map), "KMEANS_SELECTION_STATUS"] = status
     result.loc[ecgi.isin(cluster_map), "KMEANS_SILHOUETTE"] = silhouette
+    return result
+
+
+def _add_kmeans_rule_compatibility(
+    data: pd.DataFrame,
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    """Compare unsupervised groups with post-model signature labels."""
+    result = data.copy()
     if bool(args.kmeans_rule_compatibility):
         admitted = result.loc[
             col_num(result, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0).eq(1),
             ["ECGI", "KMEANS_CLUSTER", "MODE2_MAPPED_CLUSTER"],
         ].drop_duplicates("ECGI")
+        if admitted.empty:
+            return result
         priority = {
             "REAL_BACK_AND_FORTH": 4,
             "HIGH_FREQUENCY_CHANGES": 3,
@@ -3137,8 +3225,12 @@ def _add_kmeans_diagnostics(
     return result
 
 
-def _build_mode2_view(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
-    """Project Mode 2 into the established V9.8.4 summary contract."""
+def _build_mode2_view(
+    data: pd.DataFrame,
+    args: argparse.Namespace,
+    events: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Run IF-first Mode 2 and project it into the V9.8.4 summary contract."""
     if data is None or data.empty:
         return pd.DataFrame() if data is None else data.copy()
     reusable = all(
@@ -3150,27 +3242,92 @@ def _build_mode2_view(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataFr
             "IF_DOMINANT_SELECTED_FEATURE_COUNT",
             "MODE2_MAPPED_CLUSTER",
             "KMEANS_CLUSTER",
+            "MODE2_SIGNATURE_BACK_FORTH_FLAG",
+            "MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG",
+            "MODE2_SIGNATURE_MULTI_FEATURE_FLAG",
+            "MODE2_ECGI_RETAINED_FLAG",
+            "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG",
         ]
     )
     if reusable:
         result = data.copy()
     else:
         result = _ecgi_if_admission(data, args)
-        mapped = _structural_mode2_cluster(result)
-        result["MODE2_MAPPED_CLUSTER"] = result["ECGI"].map(mapped).fillna("")
+        # ML-first order: admission -> unsupervised grouping -> explanation.
         result = _add_kmeans_diagnostics(result, args)
+        result = _inspect_mode2_signatures(result, events, args)
+        result = _add_kmeans_rule_compatibility(result, args)
     admitted = col_num(result, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0).eq(1)
+    recurrent_feature = (
+        col_num(result, "SOURCE_CHANGE_DAYS", 0).ge(2)
+        & col_num(result, "SOURCE_CHANGE_EVENTS", 0).ge(2)
+    )
+    objective_conflict = (
+        col_num(result, "CURRENT_DAY_SAME_DAY_CONFLICT_FLAG", 0).eq(1)
+        | col_num(result, "RECURRENT_SAME_DAY_CONFLICT_FLAG", 0).eq(1)
+    )
+    independent_one_change_feature = (
+        admitted
+        & col_num(result, "IF_DOMINANT_FEATURE_DETECTED_FLAG", 0).eq(1)
+        & col_num(result, "SOURCE_CHANGE_DAYS", 0).eq(1)
+        & col_num(result, "SOURCE_CHANGE_EVENTS", 0).eq(1)
+        & col_num(
+            result, "MODEL_ONE_CHANGE_CONDITIONAL_AVAILABLE_FLAG", 0
+        ).eq(1)
+        & col_num(result, "MODEL_ONE_CHANGE_CONFORMAL_P_MAX", 1.0).le(
+            float(args.one_change_model_alpha)
+        )
+        & col_num(result, "OBSERVED_COVERAGE_RATE", 0).ge(
+            float(args.one_change_min_coverage)
+        )
+        & col_num(
+            result, "LATEST_OBSERVED_ON_END_DATE_FLAG", 0
+        ).eq(1)
+    )
+    result["MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FEATURE_FLAG"] = (
+        independent_one_change_feature.astype(int)
+    )
+    independent_one_change = (
+        independent_one_change_feature.groupby(result["ECGI"]).transform("max")
+        & admitted
+    )
+    result["MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG"] = independent_one_change.astype(int)
+    structural_or_recurrent = (
+        col_num(result, "MODE2_SIGNATURE_BACK_FORTH_FLAG", 0).eq(1)
+        | col_num(result, "MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG", 0).eq(1)
+        | col_num(result, "MODE2_SIGNATURE_MULTI_FEATURE_FLAG", 0).eq(1)
+        | recurrent_feature
+        | objective_conflict
+        | independent_one_change
+    )
+    retained_by_ecgi = (
+        structural_or_recurrent.groupby(result["ECGI"]).transform("max")
+        & admitted
+    )
+    result["MODE2_ECGI_RETAINED_FLAG"] = retained_by_ecgi.astype(int)
+    raw_admitted_ecgis = int(result.loc[admitted, "ECGI"].nunique())
+    retained_ecgis = int(result.loc[retained_by_ecgi, "ECGI"].nunique())
+    independent_ecgis = int(
+        result.loc[independent_one_change, "ECGI"].nunique()
+    )
+    log(
+        f"Mode-2 refinement retained {retained_ecgis:,}/{raw_admitted_ecgis:,} "
+        f"IF-admitted ECGIs; independent extreme one-change ECGIs={independent_ecgis:,}; "
+        f"ordinary one-time RARE removed={max(0, raw_admitted_ecgis-retained_ecgis):,}.",
+        1,
+    )
+    admitted = retained_by_ecgi
     mapped_cluster = result["MODE2_MAPPED_CLUSTER"]
     evidence = (
         admitted
         & (
             (
                 mapped_cluster.eq("REAL_BACK_AND_FORTH")
-                & col_num(result, "RAW_REAL_BACK_AND_FORTH_FLAG", 0).eq(1)
+                & col_num(result, "MODE2_SIGNATURE_BACK_FORTH_FLAG", 0).eq(1)
             )
             | (
                 mapped_cluster.eq("HIGH_FREQUENCY_CHANGES")
-                & col_num(result, "RAW_HIGH_FREQUENCY_CHANGES_FLAG", 0).eq(1)
+                & col_num(result, "MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG", 0).eq(1)
             )
             | (
                 mapped_cluster.eq("MULTI_FEATURE_CHANGES")
@@ -3182,7 +3339,7 @@ def _build_mode2_view(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataFr
             )
         )
     )
-    # Defensive fallback: an admitted ECGI always retains at least its IF-tail row.
+    # A retained ECGI always keeps at least one auditable evidence row.
     has_evidence = evidence.groupby(result["ECGI"]).transform("max")
     evidence = evidence | (
         admitted & ~has_evidence
@@ -3196,12 +3353,26 @@ def _build_mode2_view(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataFr
         col_num(result, "IF_DOMINANT_MAX_PERCENTILE", 0),
         0.0,
     )
+    result["REAL_BACK_AND_FORTH_FLAG"] = (
+        evidence & mapped_cluster.eq("REAL_BACK_AND_FORTH")
+    ).astype(int)
+    result["HIGH_FREQUENCY_CHANGES_FLAG"] = (
+        evidence & mapped_cluster.eq("HIGH_FREQUENCY_CHANGES")
+    ).astype(int)
+    result["RARE_CHANGES_FLAG"] = (
+        evidence & mapped_cluster.eq("RARE_CHANGES")
+    ).astype(int)
+    result["ONE_DAY_RARE_GUARD_FLAG"] = (
+        col_num(result, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0).eq(1)
+        & col_num(result, "MODE2_ECGI_RETAINED_FLAG", 0).eq(0)
+        & col_num(result, "SOURCE_CHANGE_DAYS", 0).le(1)
+    ).astype(int)
     result["MULTI_FEATURE_CHANGES_FLAG"] = (
         admitted & mapped_cluster.eq("MULTI_FEATURE_CHANGES")
     ).astype(int)
     result["MULTI_FEATURE_CONTRIBUTOR_FLAG"] = (
         result["MULTI_FEATURE_CHANGES_FLAG"].eq(1)
-        & col_num(result, "SOURCE_CHANGE_EVENTS", 0).gt(0)
+        & col_num(result, "MULTI_FEATURE_CONTRIBUTOR_FLAG", 0).eq(1)
     ).astype(int)
     result["MULTI_FEATURE_SCORE"] = np.where(
         result["MULTI_FEATURE_CHANGES_FLAG"].eq(1),
@@ -3226,12 +3397,29 @@ def _build_mode2_view(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataFr
         evidence,
         (
             "ECGI admitted by Isolation Forest percentile >= "
-            f"{float(args.if_dominant_percentile):.1f}; full source history "
+            f"{float(args.if_dominant_percentile):.4f}; full source history "
             "mapped it to the structural signature cluster"
         ),
-        "Not admitted by the Mode-2 Isolation Forest percentile gate",
+        np.where(
+            col_num(result, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0).eq(1)
+            & col_num(result, "MODE2_ECGI_RETAINED_FLAG", 0).eq(0),
+            "IF-admitted ordinary one-time change did not pass the independent "
+            "same-age one-change conformal test",
+            "Not admitted by the Mode-2 Isolation Forest percentile gate",
+        ),
     )
     result["DETECTION_MODE_TAG"] = np.where(admitted, MODE2_LABEL, "")
+    quiet_column = (
+        "QUIET_LAST_N_DAYS_FLAG"
+        if "QUIET_LAST_N_DAYS_FLAG" in result.columns
+        else "STABLE_LAST_N_DAYS_FLAG"
+    )
+    result["WOULD_OLD_STABILITY_OVERRIDE_DROP_FLAG"] = (
+        admitted
+        & col_num(result, quiet_column, 0).eq(1)
+        & result["REPORTABLE_EVIDENCE_ROW_FLAG"].eq(1)
+    ).astype(int)
+    result["DROPPED_BY_RECENCY_FLAG"] = 0
     return result
 
 
@@ -3240,19 +3428,38 @@ def finalize_detection(
     events: pd.DataFrame,
     args: argparse.Namespace,
 ) -> pd.DataFrame:
-    """Run the unchanged V9.8.4 path, then optionally add Mode 2/3 projections."""
-    mode1 = _finalize_signature_dominant(data, events, args)
+    """Run the requested detector; Mode 1 and Mode 2 are independent branches."""
+    if args.detection_mode == "if_dominant":
+        return _build_mode2_view(data, args, events)
+
     if args.detection_mode == "signature_dominant":
+        mode1 = _finalize_signature_dominant(data, events, args)
         mode1["DETECTION_MODE_TAG"] = MODE1_LABEL
         mode1["MODE1_ECGI_DETECTED_FLAG"] = (
             mode1.groupby("ECGI")["REPORTABLE_EVIDENCE_ROW_FLAG"]
             .transform("max").fillna(0).astype(int)
         ) if not mode1.empty else pd.Series(dtype=int)
         return mode1
+    # Compare mode evaluates both branches independently from the same scored
+    # raw dataset, then carries Mode-1 fields beside the Mode-2 projection.
+    # A stable row id prevents either branch's topology merge from silently
+    # aligning decisions by a newly-created pandas index.
+    row_id = "_MODE_COMPARISON_ROW_ID"
+    compare_input = data.copy()
+    compare_input[row_id] = np.arange(len(compare_input), dtype=np.int64)
+    mode1 = _finalize_signature_dominant(compare_input, events, args)
     preserved = _copy_mode1_decisions(mode1)
-    mode2 = _build_mode2_view(preserved, args)
-    if args.detection_mode == "if_dominant":
-        return mode2
+    mode2 = _build_mode2_view(compare_input, args, events)
+    mode1_columns = [
+        column for column in preserved.columns if column.startswith("MODE1_")
+    ]
+    mode2 = mode2.merge(
+        preserved[[row_id, *mode1_columns]],
+        on=row_id,
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
     # Compare mode retains the Mode-1 reporting projection while carrying every
     # Mode-2 field. The comparison summary performs the one-row ECGI union.
     for column in [
@@ -3275,6 +3482,7 @@ def finalize_detection(
         [f"{MODE1_LABEL}; {MODE2_LABEL}", MODE1_LABEL, MODE2_LABEL],
         default="",
     )
+    mode2.drop(columns=[row_id], inplace=True)
     return mode2
 
 
@@ -3522,6 +3730,8 @@ def _ecgi_kmeans_audit(data: pd.DataFrame, args: argparse.Namespace) -> pd.DataF
         "ECGI", "KMEANS_CLUSTER", "KMEANS_DISTANCE_TO_CENTROID",
         "KMEANS_SELECTED_K", "KMEANS_SELECTION_STATUS", "KMEANS_SILHOUETTE",
         "IF_DOMINANT_MAX_PERCENTILE", "IF_DOMINANT_SELECTED_FEATURE_COUNT",
+        "IF_DOMINANT_ECGI_DETECTED_FLAG", "MODE2_ECGI_RETAINED_FLAG",
+        "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG",
     ]
     if bool(args.kmeans_rule_compatibility):
         columns += [
@@ -3743,7 +3953,7 @@ def write_markdown_report(
         "",
         f"- Script version: `{SCRIPT_VERSION}`",
         f"- Detection mode: **{args.detection_mode}**",
-        f"- IF-dominant percentile: **{float(args.if_dominant_percentile):.1f}**",
+        f"- IF-dominant percentile: **{float(args.if_dominant_percentile):.4f}**",
         f"- Diagnostic KMeans: **{'auto' if args.kmeans_auto else int(args.kmeans_clusters)}**",
         f"- Analysis window: **{run_info.window_start.date()} to {run_info.window_end.date()}**",
         f"- Candidate gate: **{args.candidate_gate}**",
@@ -4145,7 +4355,7 @@ def write_mode_comparison_artifacts(
         [
             "INCIDENT_RANK", "ECGI",
             "MODE1_SIGNATURE_DOMINANT_DETECTED_FLAG",
-            "MODE2_IF_DOMINANT_DETECTED_FLAG",
+        "MODE2_IF_DOMINANT_DETECTED_FLAG",
             "MODE1_PRIMARY_ANOMALY_CLUSTER",
             "MODE2_PRIMARY_ANOMALY_CLUSTER",
             "MODE1_ANOMALY_RISK_SCORE", "MODE2_ANOMALY_RISK_SCORE",
@@ -4426,6 +4636,11 @@ def write_outputs(
         "MODEL_ONE_CHANGE_CONDITIONAL_AVAILABLE_FLAG",
         "MODEL_ONE_CHANGE_CONDITIONAL_PERCENTILE",
         "MODEL_ONE_CHANGE_CONFORMAL_P_MAX", "MODEL_ONE_CHANGE_TAIL_VOTE_SHARE",
+        "IF_DOMINANT_FEATURE_DETECTED_FLAG",
+        "IF_DOMINANT_ECGI_DETECTED_FLAG", "IF_DOMINANT_MAX_PERCENTILE",
+        "IF_DOMINANT_SELECTED_FEATURE_COUNT", "MODE2_ECGI_RETAINED_FLAG",
+        "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FEATURE_FLAG",
+        "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG",
         "FEATURE_FINAL_CLUSTER", "MULTI_FEATURE_CHANGES_FLAG",
         "REPORTABLE_EVIDENCE_ROW_FLAG",
         "WOULD_OLD_STABILITY_OVERRIDE_DROP_FLAG", "DROPPED_BY_RECENCY_FLAG",
@@ -4522,6 +4737,9 @@ def write_outputs(
         mode2_audit_columns = [
             "ECGI", "IF_DOMINANT_ECGI_DETECTED_FLAG",
             "IF_DOMINANT_FEATURE_DETECTED_FLAG", "MODE2_MAPPED_CLUSTER",
+            "MODE2_ECGI_RETAINED_FLAG",
+            "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FEATURE_FLAG",
+            "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG",
             "MODEL_NORMAL_PERCENTILE", "IF_DOMINANT_MAX_PERCENTILE",
             "IF_DOMINANT_SELECTED_FEATURE_COUNT", "KMEANS_CLUSTER",
             "KMEANS_DISTANCE_TO_CENTROID", "KMEANS_SELECTED_K",
@@ -4570,6 +4788,30 @@ def write_outputs(
         "mode2_mapping_priority": (
             "REAL_BACK_AND_FORTH>HIGH_FREQUENCY_CHANGES>"
             "MULTI_FEATURE_CHANGES>RARE_CHANGES_FALLBACK"
+        ),
+        "mode2_raw_if_admitted_ecgis": (
+            int(candidate.loc[
+                col_num(
+                    candidate, "IF_DOMINANT_ECGI_DETECTED_FLAG", 0
+                ).eq(1),
+                "ECGI",
+            ].nunique()) if not candidate.empty else 0
+        ),
+        "mode2_refined_retained_ecgis": (
+            int(candidate.loc[
+                col_num(candidate, "MODE2_ECGI_RETAINED_FLAG", 0).eq(1),
+                "ECGI",
+            ].nunique()) if not candidate.empty else 0
+        ),
+        "mode2_independent_extreme_one_change_ecgis": (
+            int(candidate.loc[
+                col_num(
+                    candidate,
+                    "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG",
+                    0,
+                ).eq(1),
+                "ECGI",
+            ].nunique()) if not candidate.empty else 0
         ),
         "candidate_gate": str(args.candidate_gate),
         "candidate_gate_days": int(args.candidate_gate_days or args.days),
@@ -4720,7 +4962,7 @@ def write_outputs(
 Selected detection mode: `{args.detection_mode}`.
 
 `signature_dominant` preserves the V9.8.4 decision behavior. `if_dominant`
-admits ECGIs at IF percentile {float(args.if_dominant_percentile):.1f}, clusters
+admits ECGIs at IF percentile {float(args.if_dominant_percentile):.4f}, clusters
 the admitted ECGI vectors with diagnostic KMeans, and maps final labels only
 with the full-history signature engine. `compare` writes
 `cesmlc_v985_mode_comparison.csv`, detector/cluster agreement columns, and
@@ -4748,8 +4990,11 @@ Open first:
 18. `cesmlc_v985_detector_agreement_pie.png` (Mode 3 unless disabled)
 
 This is a clean V9.5/V9.6 branch. It has exactly four final clusters and no legacy
-fallback/default/location/invalid/persistent/rollout cluster logic. Once a cluster
-definition qualifies, its score ranks it but cannot filter it out.
+default/location/invalid/persistent/rollout cluster logic. In Mode 1, a qualified
+signature cannot be removed by a score threshold. In Mode 2, the configured IF
+percentile is the admission gate; after admission, structural inspection maps the
+label. Only an ordinary one-time RARE fallback is withheld unless the held-out
+same-age one-change conformal test independently confirms it as extreme.
 
 Candidate gate: `{args.candidate_gate}` across the ending
 `{int(args.candidate_gate_days or args.days)}` date(s), with at least
@@ -4769,9 +5014,10 @@ processing with SITE_TYPE=UNKNOWN. COW is not a training stratum, penalty, or su
 UNKNOWN is retained; it is never an exclusion condition.
 
 The Isolation Forest uses a deterministic multi-seed ensemble. Each seed is calibrated
-against the same untouched outer normal holdout, and the median percentile drives the
-existing V9.7 rare-pattern rule. With `--tune-isolation-forest`, parameter selection occurs
-only inside the fit pool; candidates and the outer holdout are never inspected.
+against the same untouched outer normal holdout. The median percentile supports the
+existing Mode-1 rare-pattern rule and is the explicit admission statistic in Mode 2.
+With `--tune-isolation-forest`, parameter selection occurs only inside the fit pool;
+candidates and the outer holdout are never inspected.
 Only candidate feature histories with a real inter-day transition are model-scored;
 unchanged rows cannot enter either model decision branch and remain fully available to
 the independent current-state conflict and output-audit paths.
@@ -5439,11 +5685,34 @@ def run_self_tests() -> int:
         "Mode 1 rows carry the IF + SIGNATURE provenance tag",
     )
 
-    mode_fixture = legacy_direct.copy()
+    # Mode 2 must work from scored temporal rows with no Mode-1 decisions.
+    mode2_multi_rows = pd.DataFrame([
+        row("MODE2_MULTI", "CELLTYPE", SOURCE_CHANGE_EVENTS=1, SOURCE_CHANGE_DAYS=1),
+        row("MODE2_MULTI", "GEOTYPE", SOURCE_CHANGE_EVENTS=1, SOURCE_CHANGE_DAYS=1),
+        row(
+            "MODE2_MULTI", "SUPPORTEDTECHNOLOGIES",
+            SOURCE_CHANGE_EVENTS=1, SOURCE_CHANGE_DAYS=1,
+        ),
+    ])
+    mode2_multi_events = pd.DataFrame([
+        event("MODE2_MULTI", "CELLTYPE", "2026-01-22"),
+        event("MODE2_MULTI", "GEOTYPE", "2026-01-25"),
+        event("MODE2_MULTI", "SUPPORTEDTECHNOLOGIES", "2026-01-28"),
+    ])
+    mode_fixture = pd.concat(
+        [feature_rows.copy(), mode2_multi_rows], ignore_index=True, sort=False
+    )
     mode_fixture["MODEL_AVAILABLE_FLAG"] = 1
     mode_fixture["MODEL_NORMAL_PERCENTILE"] = 50.0
     mode_fixture.loc[
-        mode_fixture["ECGI"].isin(["BF", "HF4", "RARE_TWO"]),
+        mode_fixture["ECGI"].isin(
+            ["BF", "HF4", "RARE_TWO", "RARE_ONE", "RARE_ONE_CONDITIONAL"]
+        ),
+        "MODEL_NORMAL_PERCENTILE",
+    ] = 99.0
+    mode_fixture.loc[
+        mode_fixture["ECGI"].eq("MODE2_MULTI")
+        & mode_fixture["FEATURE"].eq("CELLTYPE"),
         "MODEL_NORMAL_PERCENTILE",
     ] = 99.0
     mode_fixture.loc[
@@ -5456,21 +5725,56 @@ def run_self_tests() -> int:
     mode_args.kmeans_clusters = 4
     mode_args.kmeans_auto = False
     mode_args.kmeans_rule_compatibility = False
-    mode2 = _build_mode2_view(
-        _copy_mode1_decisions(mode_fixture), mode_args
-    )
+    forbidden_mode1_inputs = [
+        column for column in mode_fixture.columns
+        if column.startswith("MODE1_") or column.startswith("RAW_")
+    ]
+    mode_fixture = mode_fixture.drop(columns=forbidden_mode1_inputs)
+    mode2 = _build_mode2_view(mode_fixture, mode_args, mode2_multi_events)
     mode2_ecgi = mode2.groupby("ECGI", as_index=False).head(1).set_index("ECGI")
     check(
         mode2_ecgi.loc["BF", "MODE2_MAPPED_CLUSTER"] == "REAL_BACK_AND_FORTH"
         and mode2_ecgi.loc["HF4", "MODE2_MAPPED_CLUSTER"]
         == "HIGH_FREQUENCY_CHANGES"
+        and mode2_ecgi.loc["MODE2_MULTI", "MODE2_MAPPED_CLUSTER"]
+        == "MULTI_FEATURE_CHANGES"
         and mode2_ecgi.loc["RARE_TWO", "MODE2_MAPPED_CLUSTER"]
         == "RARE_CHANGES",
         "Mode 2 IF admission is mapped by BF > HF > MULTI > RARE structural priority",
     )
     check(
+        not forbidden_mode1_inputs
+        and {
+            "MODE2_SIGNATURE_BACK_FORTH_FLAG",
+            "MODE2_SIGNATURE_HIGH_FREQUENCY_FLAG",
+            "MODE2_SIGNATURE_MULTI_FEATURE_FLAG",
+        }.issubset(mode2.columns),
+        "Mode 2 performs fresh signature inspection without Mode-1/RAW decision inputs",
+    )
+    check(
         mode2_ecgi.loc["CURRENT_CONFLICT", "IF_DOMINANT_ECGI_DETECTED_FLAG"] == 0,
         "Conflict-only unscored/no-transition evidence cannot enter IF-dominant mode",
+    )
+    check(
+        mode2_ecgi.loc["RARE_ONE", "IF_DOMINANT_ECGI_DETECTED_FLAG"] == 1
+        and mode2_ecgi.loc["RARE_ONE", "MODE2_ECGI_RETAINED_FLAG"] == 0
+        and mode2_ecgi.loc[
+            "RARE_ONE", "REPORTABLE_EVIDENCE_ROW_FLAG"
+        ] == 0,
+        "Mode 2 exposes but does not report an ordinary one-time IF admission",
+    )
+    check(
+        mode2_ecgi.loc[
+            "RARE_ONE_CONDITIONAL",
+            "MODE2_INDEPENDENT_ONE_CHANGE_EXTREME_FLAG",
+        ] == 1
+        and mode2_ecgi.loc[
+            "RARE_ONE_CONDITIONAL", "MODE2_ECGI_RETAINED_FLAG"
+        ] == 1
+        and mode2_ecgi.loc[
+            "RARE_ONE_CONDITIONAL", "MODE2_MAPPED_CLUSTER"
+        ] == "RARE_CHANGES",
+        "Mode 2 retains an independently calibrated extreme one-time change",
     )
     check(
         "KMEANS_RULE_COMPATIBILITY" not in mode2.columns,
@@ -5485,6 +5789,32 @@ def run_self_tests() -> int:
         ) == 1,
         "Mode 2 exposes its admitting IF maximum and selected-feature count",
     )
+    nonconsecutive_fixture = mode_fixture.copy()
+    nonconsecutive_fixture.index = np.arange(
+        100, 100 + 3 * len(nonconsecutive_fixture), 3
+    )
+    nonconsecutive_mode2 = _build_mode2_view(
+        nonconsecutive_fixture, mode_args, mode2_multi_events
+    )
+    check(
+        len(nonconsecutive_mode2) == len(mode_fixture)
+        and set(
+            nonconsecutive_mode2.loc[
+                nonconsecutive_mode2["IF_DOMINANT_ECGI_DETECTED_FLAG"].eq(1),
+                "MODE2_MAPPED_CLUSTER",
+            ]
+        ) == {
+            "REAL_BACK_AND_FORTH",
+            "HIGH_FREQUENCY_CHANGES",
+            "MULTI_FEATURE_CHANGES",
+            "RARE_CHANGES",
+        },
+        "Mode 2 remains aligned after topology replaces a non-consecutive source index",
+    )
+    check(
+        not build_feature_detection_diagnostics(mode2, mode_args).empty,
+        "Mode 2 supplies a complete production feature-diagnostics contract",
+    )
     singleton_k = _choose_kmeans_k(
         np.zeros((1, 3)), 4, False, 8, 42
     )
@@ -5498,7 +5828,7 @@ def run_self_tests() -> int:
     compatibility_args = argparse.Namespace(**vars(mode_args))
     compatibility_args.kmeans_rule_compatibility = True
     compatible_mode2 = _build_mode2_view(
-        _copy_mode1_decisions(mode_fixture), compatibility_args
+        mode_fixture, compatibility_args, mode2_multi_events
     )
     check(
         {
@@ -5512,10 +5842,30 @@ def run_self_tests() -> int:
         ].between(0, 1).all(),
         "Optional KMeans compatibility includes cluster size and majority-rule purity",
     )
+    original_mode1_function = globals()["_finalize_signature_dominant"]
+    mode1_called_by_mode2 = False
+
+    def forbidden_mode1_call(*_args: Any, **_kwargs: Any) -> pd.DataFrame:
+        nonlocal mode1_called_by_mode2
+        mode1_called_by_mode2 = True
+        raise AssertionError("Standalone Mode 2 called Mode 1")
+
+    globals()["_finalize_signature_dominant"] = forbidden_mode1_call
+    try:
+        standalone_mode2 = finalize_detection(
+            mode_fixture, mode2_multi_events, mode_args
+        )
+        standalone_mode2_ok = not standalone_mode2.empty
+    finally:
+        globals()["_finalize_signature_dominant"] = original_mode1_function
+    check(
+        standalone_mode2_ok and not mode1_called_by_mode2,
+        "Standalone Mode 2 never executes the Mode-1 signature-dominant branch",
+    )
     compare_args = argparse.Namespace(**vars(mode_args))
     compare_args.detection_mode = "compare"
     compare_data = finalize_detection(
-        mode_fixture, pd.DataFrame(), compare_args
+        mode_fixture, mode2_multi_events, compare_args
     )
     compare_summary = build_ecgi_summary(compare_data, compare_args)
     check(
@@ -5933,7 +6283,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"Output: {out_dir}")
     log(
         f"Detection mode={args.detection_mode}; "
-        f"IF-dominant percentile={float(args.if_dominant_percentile):.1f}; "
+        f"IF-dominant percentile={float(args.if_dominant_percentile):.4f}; "
         f"KMeans={'auto' if args.kmeans_auto else int(args.kmeans_clusters)} "
         "(diagnostic only)."
     )
