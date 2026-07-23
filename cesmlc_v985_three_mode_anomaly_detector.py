@@ -1,3 +1,44 @@
+
+
+
+
+python "C:\Temp\cesmlc_v985_three_mode_anomaly_detector.py" `
+  --input "C:\Temp\enmt_cesmlc_lte_audit_p_akr3aesme01_31d_withDB_v3.csv" `
+  --cell-viewer-data "C:\Temp\cell_viewer_data.csv" `
+  --strict-site-type-context `
+  --candidate-gate window_any_mismatch `
+  --candidate-gate-days 30 `
+  --candidate-mismatch-min-days 1 `
+  --out-dir "C:\Temp\v985_mode3_outputs" `
+  --days 30 `
+  --stable-days 10 `
+  --history-anchor-days 7 `
+  --latlon-decimals 5 `
+  --high-frequency-min-change-days 2 `
+  --multi-feature-min-features 2 `
+  --multi-feature-min-dates 2 `
+  --multi-max-dominant-date-share 0.67 `
+  --detection-mode 3 `
+  --if-dominant-percentile 98 `
+  --kmeans-clusters 4 `
+  --kmeans-rule-compatibility `
+  --tune-isolation-forest `
+  --isolation-seeds "17,42,73" `
+  --isolation-n-estimators 400 `
+  --isolation-max-samples 2048 `
+  --isolation-max-features 0.80 `
+  --normal-baseline-max-ecgis 50000 `
+  --isolation-fit-sample 50000 `
+  --memory-limit 10GB `
+  --threads 4 `
+  --feature-batch-size 1 `
+  --reuse-history-cache `
+  --history-cache-dir "C:\Temp\cesmlc_v984_window_gate_cache" `
+  --cache-match-mode compatible `
+  --cache-input-identity basename
+
+
+
 #!/usr/bin/env python
 """
 CESMLC V9.8.5 three-mode, window-mismatch, memory-efficient detector.
